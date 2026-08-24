@@ -60,7 +60,11 @@ def attempt_login(username: str, password: str):
         st.session_state.login_error = "Please enter a username."
         return
 
-    loader = instaloader.Instaloader(save_metadata=False, quiet=True)
+    # Keep retries low: instaloader's default (3 attempts) can back off for many minutes
+    # per attempt when Instagram rate-limits a query (self-imposed cooldowns of 10+ minutes
+    # are common), which would otherwise block this synchronous app for a very long time.
+    # Failing fast lets the user see a clear error and retry manually instead.
+    loader = instaloader.Instaloader(save_metadata=False, quiet=True, max_connection_attempts=1)
 
     try:
         loader.load_session_from_file(username)
@@ -248,6 +252,8 @@ def download_stories(loader: instaloader.Instaloader, target_accounts: list[str]
             profiles.append(resolve_profile(loader, name))
         except instaloader.exceptions.ProfileNotExistsException as e:
             log(f"[{name}] {e}")
+        except instaloader.exceptions.ConnectionException as e:
+            log(f"[{name}] Instagram rate-limited or refused this request, skipping: {e}")
 
     if not profiles:
         log("No valid profiles found.")
@@ -256,11 +262,14 @@ def download_stories(loader: instaloader.Instaloader, target_accounts: list[str]
     user_ids = [p.userid for p in profiles]
 
     downloaded = 0
-    for story in loader.get_stories(userids=user_ids):
-        for item in story.get_items():
-            loader.download_storyitem(item, target=story.owner_username)
-            downloaded += 1
-        log(f"[{story.owner_username}] Downloaded story item(s).")
+    try:
+        for story in loader.get_stories(userids=user_ids):
+            for item in story.get_items():
+                loader.download_storyitem(item, target=story.owner_username)
+                downloaded += 1
+            log(f"[{story.owner_username}] Downloaded story item(s).")
+    except instaloader.exceptions.ConnectionException as e:
+        log(f"Instagram rate-limited or refused this request: {e}")
 
     log(f"Done downloading stories. {downloaded} item(s) downloaded.")
     return downloaded
