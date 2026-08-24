@@ -1,0 +1,8 @@
+# NOTE: PyPI's instaloader release (4.15.3) predates Instagram's late-June-2026
+# GraphQL doc_id deprecation and will fail with errors like:
+#   "Asset asset://laser.provider/ig_business_category_subvertical has been deleted."
+# The fix is merged on GitHub master but not yet released to PyPI, so install
+# straight from the repo until a new release ships:
+https://github.com/instaloader/instaloader/archive/refs/heads/master.zip
+streamlit>=1.61
+pandas>=3.0
