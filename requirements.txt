@@ -6,3 +6,9 @@
 https://github.com/instaloader/instaloader/archive/refs/heads/master.zip
 streamlit>=1.61
 pandas>=3.0
+
+# On-Screen Text (OCR) tab: extracts text overlays baked into story/reel video
+# frames. Pulls in torch as a dependency (large download, ~100s of MB) and, on
+# first use, downloads EasyOCR's model weights.
+easyocr>=1.7
+opencv-python-headless>=4.9
