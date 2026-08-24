@@ -7,16 +7,21 @@ Combines the features from insta_scraper.ipynb into a single deployable app:
   - "Stories" tab: download current stories for the selected accounts.
   - "Reels" tab: download the latest reel, or all reels since a given date,
     for the selected accounts (correctly handling pinned posts).
+  - "On-Screen Text" tab: OCR downloaded story/reel videos to extract any
+    text overlays baked into the video frames (e.g. text stickers), and
+    search across extracted text.
 
 Run with:
     streamlit run app.py
 """
 
+import json
 import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import cv2
 import instaloader
 import pandas as pd
 import streamlit as st
@@ -381,6 +386,138 @@ def list_downloaded_files(root: str):
 
 
 # ----------------------------------------------------------------------------
+# On-screen text extraction (OCR)
+# ----------------------------------------------------------------------------
+#
+# Instagram doesn't expose text overlays/stickers added on top of a Story or
+# Reel as structured metadata — that text is baked directly into the video's
+# pixels when the story/reel is created. The only way to recover it is OCR:
+# sample frames from the downloaded video and run them through an OCR engine.
+
+OCR_INDEX_PATH = Path("ocr_text_index.json")
+
+
+def get_ocr_reader():
+    """Lazily create (and cache) the EasyOCR reader. Loading the model is slow
+    the first time (downloads model weights), so it's cached in session_state."""
+    if "ocr_reader" not in st.session_state:
+        import easyocr
+        st.session_state.ocr_reader = easyocr.Reader(["en"])
+    return st.session_state.ocr_reader
+
+
+def extract_frames(video_path: Path, interval_sec: float = 1.0):
+    """Yield (timestamp_seconds, frame) tuples sampled every `interval_sec` seconds."""
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_interval = max(int(fps * interval_sec), 1)
+
+    frames = []
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx % frame_interval == 0:
+            frames.append((idx / fps, frame))
+        idx += 1
+    cap.release()
+    return frames
+
+
+def extract_text_from_video(reader, video_path: Path, interval_sec: float = 1.0,
+                             min_confidence: float = 0.5) -> dict:
+    """Sample frames from a video and OCR each one, de-duplicating repeated text
+    (e.g. text that's on screen for several sampled frames in a row)."""
+    detections = []
+    seen_texts = set()
+
+    for timestamp, frame in extract_frames(video_path, interval_sec=interval_sec):
+        for _, text, confidence in reader.readtext(frame):
+            text = text.strip()
+            if not text or confidence < min_confidence:
+                continue
+            key = text.lower()
+            if key in seen_texts:
+                continue
+            seen_texts.add(key)
+            detections.append({
+                "timestamp": round(timestamp, 2),
+                "text": text,
+                "confidence": round(float(confidence), 3),
+            })
+
+    return {
+        "video_path": str(video_path),
+        "detections": detections,
+        "full_text": " ".join(d["text"] for d in detections),
+    }
+
+
+def load_ocr_index() -> list[dict]:
+    if OCR_INDEX_PATH.exists():
+        return json.loads(OCR_INDEX_PATH.read_text(encoding="utf-8"))
+    return []
+
+
+def save_ocr_index(index: list[dict]):
+    OCR_INDEX_PATH.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def extract_text_from_new_videos(reader, root_dirs: list[str], interval_sec: float, log) -> list[dict]:
+    index = load_ocr_index()
+    indexed_paths = {entry["video_path"] for entry in index}
+
+    video_files = []
+    for root in root_dirs:
+        root_path = Path(root)
+        if root_path.exists():
+            video_files.extend(sorted(root_path.rglob("*.mp4")))
+
+    new_count = 0
+    for video_path in video_files:
+        if str(video_path) in indexed_paths:
+            continue
+        log(f"Extracting on-screen text from {video_path}...")
+        try:
+            result = extract_text_from_video(reader, video_path, interval_sec=interval_sec)
+            index.append(result)
+            new_count += 1
+        except Exception as e:
+            log(f"Failed to process {video_path}: {e}")
+
+    save_ocr_index(index)
+    log(f"Processed {new_count} new video(s). Index now has {len(index)} entries.")
+    return index
+
+
+def search_ocr_text(keywords: list[str], match_all: bool = False, case_sensitive: bool = False) -> list[dict]:
+    index = load_ocr_index()
+    results = []
+
+    for entry in index:
+        text = entry["full_text"] if case_sensitive else entry["full_text"].lower()
+        search_terms = keywords if case_sensitive else [k.lower() for k in keywords]
+
+        matched_terms = [term for term in search_terms if term in text]
+        is_match = (len(matched_terms) == len(search_terms)) if match_all else bool(matched_terms)
+        if not is_match:
+            continue
+
+        matching_detections = [
+            d for d in entry["detections"]
+            if any(term in (d["text"] if case_sensitive else d["text"].lower()) for term in matched_terms)
+        ]
+        results.append({
+            "video_path": entry["video_path"],
+            "matched_keywords": matched_terms,
+            "matching_detections": matching_detections,
+        })
+
+    return results
+
+
+# ----------------------------------------------------------------------------
 # Main app
 # ----------------------------------------------------------------------------
 
@@ -390,7 +527,7 @@ if not st.session_state.logged_in:
     st.info("Log in with your Instagram account in the sidebar to get started.")
     st.stop()
 
-tab_stories, tab_reels = st.tabs(["Stories", "Reels"])
+tab_stories, tab_reels, tab_ocr = st.tabs(["Stories", "Reels", "On-Screen Text"])
 
 with tab_stories:
     st.subheader("Download Stories")
@@ -455,3 +592,51 @@ with tab_reels:
             with st.expander(f"Downloaded files ({len(files)})"):
                 for f in files:
                     st.text(f)
+
+with tab_ocr:
+    st.subheader("Extract On-Screen Text (OCR)")
+    st.caption(
+        "Instagram doesn't expose text stickers/overlays as metadata — they're baked into "
+        "the video pixels. This scans downloaded story/reel videos with OCR (EasyOCR) to pull "
+        "out visible on-screen text. Accuracy varies with font, animation, and background "
+        "contrast, and it will not be as reliable as a real caption."
+    )
+
+    sources = st.multiselect(
+        "Folders to scan", ["stories", "reels"], default=["stories", "reels"], key="ocr_sources"
+    )
+    interval = st.slider(
+        "Sample every N seconds", 0.5, 5.0, 1.0, step=0.5, key="ocr_interval",
+        help="Smaller values catch more text but take longer to process.",
+    )
+
+    if st.button("Extract Text", disabled=not sources, key="ocr_extract_btn"):
+        with st.spinner("Loading OCR model (first run downloads model weights, this can take a while)..."):
+            reader = get_ocr_reader()
+
+        log_placeholder = st.empty()
+        log = make_logger(log_placeholder)
+        with st.spinner("Extracting on-screen text..."):
+            extract_text_from_new_videos(reader, sources, interval, log)
+
+    st.divider()
+    st.subheader("Search extracted text")
+
+    query = st.text_input("Keywords (comma-separated)", key="ocr_search_query")
+    match_all = st.checkbox("Match all keywords", key="ocr_match_all")
+
+    if st.button("Search", key="ocr_search_btn"):
+        keywords = [k.strip() for k in query.split(",") if k.strip()]
+        if not keywords:
+            st.warning("Enter at least one keyword.")
+        else:
+            results = search_ocr_text(keywords, match_all=match_all)
+            if not results:
+                st.info(f"No matches found for {keywords}.")
+            else:
+                st.write(f"Found {len(results)} matching video(s):")
+                for r in results:
+                    with st.expander(r["video_path"]):
+                        st.write(f"Matched: {', '.join(r['matched_keywords'])}")
+                        for d in r["matching_detections"]:
+                            st.text(f"[{d['timestamp']}s] {d['text']} (confidence {d['confidence']})")
