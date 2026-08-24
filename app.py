@@ -84,6 +84,14 @@ def attempt_login(username: str, password: str):
         st.session_state.login_error = "Invalid username or password."
     except instaloader.exceptions.ConnectionException as e:
         st.session_state.login_error = f"Connection error: {e}"
+    except instaloader.exceptions.LoginException as e:
+        st.session_state.login_error = (
+            f"Instagram rejected the login attempt ({e}). This often happens when logging in "
+            "from a cloud/datacenter IP address (e.g. Streamlit Community Cloud) that Instagram "
+            "flags as suspicious. Try again in a few minutes, log in from a residential IP first "
+            "to clear any checkpoint, or run this app on a host with a residential/non-datacenter "
+            "IP."
+        )
 
 
 def submit_two_factor_code(code: str):
@@ -99,6 +107,8 @@ def submit_two_factor_code(code: str):
         st.session_state.login_error = None
     except instaloader.exceptions.BadCredentialsException:
         st.session_state.login_error = "Invalid or expired 2FA code, try again."
+    except instaloader.exceptions.LoginException as e:
+        st.session_state.login_error = f"Instagram rejected the 2FA attempt: {e}"
 
 
 def log_out():
